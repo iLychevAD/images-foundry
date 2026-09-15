@@ -16,7 +16,7 @@ The current approach makes it difficult to:
 
 ## Proposed solution
 
-Images Foundry will provide one version-controlled catalog of allowed container images. Every image will have a canonical, machine-readable record containing its immutable digest, ownership, permitted use cases, lifecycle status, and relevant security metadata.
+Images Foundry will provide one version-controlled catalog of allowed container images. The catalog on the `main` branch is the source of truth. Every image will have a canonical, machine-readable record containing its immutable digest, ownership, permitted use cases, lifecycle status, and relevant security metadata.
 
 SDLC actors will consume or validate against the same published catalog instead of maintaining independent allowlists.
 
@@ -40,6 +40,21 @@ Images Foundry is a policy and inventory layer. It does not replace a container 
 - Support automated validation and straightforward integration with existing tools.
 - Provide a controlled migration path when an approved image is replaced or retired.
 
+## Repository model
+
+The MVP uses Git as both the change-control system and the audit log:
+
+- `main` contains the effective catalog and must always be valid;
+- direct pushes to `main` are disabled;
+- any contributor may propose an image through a pull or merge request;
+- required owners review the proposal before it is merged;
+- CI validates the catalog and verifies the proposed image;
+- merging publishes a new immutable catalog snapshot for consumers.
+
+An entry in an open pull or merge request is a proposal. It does not become allowed until the change is approved, merged into `main`, and published. Approval information comes from the reviewed Git change; contributors must not approve their own entries by writing an `approvedBy` field.
+
+The catalog should initially live in one file, `catalog/images.yaml`. A single file is easy to review, validate, and publish atomically. If the catalog grows large enough to cause frequent merge conflicts, it can be split into `catalog/images/<id>.yaml` files while CI continues to generate one canonical catalog artifact for consumers.
+
 ## Non-goals
 
 The initial solution will not:
@@ -52,45 +67,134 @@ The initial solution will not:
 
 Images Foundry may integrate with build, registry, signing, and scanning systems to verify their results.
 
-## Image record
+## Catalog format
 
-Each approved image should include at least:
+YAML is the recommended authoring format because it is readable in reviews, produces understandable diffs, and is widely supported by CI and infrastructure tooling. A versioned document envelope allows the schema to evolve without silently changing the meaning of existing entries.
 
-| Field | Purpose |
-| --- | --- |
-| `name` | Stable logical identifier used by people and integrations |
-| `repository` | Fully qualified registry and repository path |
-| `digest` | Immutable content digest of the approved artifact |
-| `tags` | Optional human-friendly version labels |
-| `allowedFor` | Approved use cases, such as `ci`, `build`, or `runtime` |
-| `environments` | Environments in which the image may be used |
-| `owner` | Team responsible for the image record |
-| `status` | Lifecycle state: `proposed`, `approved`, `deprecated`, or `blocked` |
-| `provenance` | Build, signature, or source information used during approval |
-| `expiresAt` | Optional date after which the approval must be reviewed |
-| `replacedBy` | Optional successor for a deprecated or blocked image |
-
-Example:
+An image record represents a logical image family, such as `nodejs20` or `kyverno`. Each family contains one or more explicitly approved versions. Keeping versions inside the family permits a safe rollout in which an old and a new digest are allowed at the same time.
 
 ```yaml
-apiVersion: images-foundry/v1
+apiVersion: images-foundry.io/v1alpha1
+kind: ImageCatalog
+metadata:
+  name: organization
+
 images:
-  - name: example-runtime
-    repository: registry.example.com/platform/example-runtime
-    digest: sha256:<immutable-digest>
-    tags:
-      - "1.2.3"
-    allowedFor:
+  - id: nodejs20
+    description: Organization-maintained Node.js 20 runtime based on the upstream image.
+    sourceType: upstream-copy
+    owner:
+      team: platform
+      contact: platform@example.com
+    allowedUses:
+      - build
+      - ci
       - runtime
     environments:
       - development
       - staging
       - production
-    owner: platform-team
-    status: approved
+    versions:
+      - version: "20.19.4-org.1"
+        image:
+          repository: registry.example.com/base/node
+          tag: "20.19.4-org.1"
+          digest: "sha256:<immutable-digest>"
+        upstream:
+          repository: docker.io/library/node
+          tag: "20.19.4"
+          digest: "sha256:<upstream-immutable-digest>"
+        platforms:
+          - linux/amd64
+          - linux/arm64
+        status: approved
+        reviewAfter: "2026-12-15"
+
+  - id: kyverno
+    description: Organization-maintained copy of the upstream Kyverno image.
+    sourceType: upstream-copy
+    owner:
+      team: platform-security
+    allowedUses:
+      - runtime
+    environments:
+      - staging
+      - production
+    versions:
+      - version: "1.16.0-org.1"
+        image:
+          repository: registry.example.com/security/kyverno
+          tag: "1.16.0-org.1"
+          digest: "sha256:<immutable-digest>"
+        upstream:
+          repository: ghcr.io/kyverno/kyverno
+          tag: "v1.16.0"
+          digest: "sha256:<upstream-immutable-digest>"
+        status: approved
 ```
 
-Tags are useful for people, but enforcement must use the repository and digest because tags can be moved to different image contents.
+Tags and version labels are present for people. Enforcement must use the repository and digest because tags can be moved to different image contents.
+
+### Image family fields
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `id` | Yes | Stable, unique, lowercase identifier used by people and integrations |
+| `description` | Yes | Explains what the image is and why the organization provides it |
+| `sourceType` | Yes | Declares `upstream-copy`, `internal-build`, or `external-direct` |
+| `owner.team` | Yes | Team responsible for updates, review, and incident response |
+| `owner.contact` | No | Contact address or team channel |
+| `allowedUses` | Yes | Explicitly permits `build`, `ci`, and/or `runtime` use |
+| `environments` | Yes | Explicitly lists permitted deployment environments |
+| `versions` | Yes | One or more version records containing approved artifacts |
+
+Use and environment scopes are required rather than defaulting to “everywhere.” This avoids accidentally granting broader access when a contributor omits a field.
+
+`sourceType` makes provenance requirements unambiguous: `upstream-copy` is an organization-maintained copy of an external image, `internal-build` is produced from organization-owned source, and `external-direct` is consumed directly from an external registry.
+
+### Version fields
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `version` | Yes | Human-readable organization version; unique within the image family |
+| `image.repository` | Yes | Fully qualified registry and repository path |
+| `image.digest` | Yes | Immutable digest used for policy decisions |
+| `image.tag` | No | Human-readable registry tag; never sufficient for enforcement |
+| `upstream.repository` | For `upstream-copy` | Original repository from which the organization image was derived |
+| `upstream.digest` | For `upstream-copy` | Immutable identity of the upstream artifact |
+| `upstream.tag` | No | Human-readable upstream version |
+| `platforms` | No | Supported OCI platforms when consumers need this information |
+| `status` | Yes | `approved`, `deprecated`, or `blocked` |
+| `reviewAfter` | No | Date on which the owner must re-evaluate the approval |
+| `allowUntil` | For deprecation | Final date on which a deprecated version remains allowed |
+| `replacedBy` | No | Replacement in the form `<image-id>@<version>` |
+
+Do not copy volatile data such as CVE lists or current scan results into the catalog. CI should verify signatures, attestations, SBOMs, scan policy, and registry existence against the digest during review. This keeps security evidence tied to the actual artifact without allowing stale results to appear authoritative.
+
+### Lifecycle semantics
+
+- `approved`: the version is allowed within its declared use and environment scopes.
+- `deprecated`: the version remains allowed with a warning until `allowUntil`, giving consumers time to migrate.
+- `blocked`: the version is denied immediately in every scope.
+- an expired deprecated version is denied even if its record remains in the catalog.
+
+There is intentionally no `proposed` status in the published catalog: the pull or merge request itself represents that state.
+
+## Catalog validation
+
+Every pull or merge request must pass automated checks for:
+
+- valid YAML and conformance to a versioned JSON Schema;
+- unique image IDs and unique versions within each image family;
+- valid, fully qualified repositories and `sha256` digests;
+- existence of every referenced digest in its registry;
+- permitted values for uses, environments, platforms, and lifecycle states;
+- required upstream metadata for copied images;
+- valid dates and replacement references;
+- configured signature, provenance, SBOM, vulnerability, and license policies;
+- authorization from the relevant catalog and image owners.
+
+The merge must be rejected if any required check fails. Validation errors should point to the exact image, version, field, and remediation.
 
 ## Approval and publication workflow
 
@@ -120,7 +224,7 @@ Service build and deployment workflows should validate base images and runtime i
 ## Functional requirements
 
 1. The catalog must use a documented, versioned schema.
-2. Every approved image must have a unique logical name and an immutable digest.
+2. Every image family must have a unique ID, and every approved version must be pinned to an immutable digest.
 3. Changes must be validated automatically before publication.
 4. Consumers must be able to retrieve a complete, deterministic catalog snapshot.
 5. Policy checks must explain why an image is allowed or denied.
@@ -173,4 +277,3 @@ The MVP is complete when:
 - Who can approve records, emergency blocks, and temporary exceptions?
 - What freshness limit is acceptable for a cached catalog?
 - Is policy global, or can teams add stricter rules without weakening the central baseline?
-
