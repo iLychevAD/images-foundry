@@ -28,6 +28,73 @@ docker build --check .
 docker build .
 ```
 
+## Image dependencies
+
+A Foundry image may use another Foundry image in `FROM`; no manually maintained `depends_on` field is needed. During each build, CI resolves every `FROM` reference—including build arguments and multi-stage builds—to a full reference and digest. Foundry references become dependency edges; external references remain upstream provenance.
+
+The resulting graph supports more than documentation:
+
+- reject self-dependencies and cycles;
+- find every image affected by a changed base digest;
+- rebuild or mark those derived images stale;
+- block removal while derived images or external consumers still use the image.
+
+The final image also records the standard [OCI base-name and base-digest annotations](https://github.com/opencontainers/image-spec/blob/main/annotations.md). These describe its immediate base; the Foundry graph retains all build-stage dependencies.
+
+## Consumer inventory
+
+The inventory must answer: **which consumer uses which Foundry image, where, at which source revision, and—when resolvable—at which digest?** Reports return to a small Foundry control plane deployed from this repository, not as Git commits. The same detector supports both enforcement and tracking, but they are different controls: enforcement rejects forbidden references; reporting records allowed ones.
+
+### Discovery
+
+| Consumer | Observation point |
+| --- | --- |
+| GitLab CI | The central configuration’s inventory job reads the [merged pipeline configuration](https://docs.gitlab.com/api/lint/) and extracts job/service images; centrally owned jobs can also report their actual `CI_JOB_IMAGE`. |
+| GitHub Actions | A central [reusable workflow](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows) reports the images it controls and the calling repository/revision; a repository scan covers other workflow declarations. |
+| Application repositories | CI resolves images in Dockerfile `FROM` instructions and deployment/test configuration, with repository path as the location. |
+| Helm repositories | CI runs [`helm template`](https://helm.sh/docs/helm/helm_template/) for every supported values set and scans the resulting Pod specifications; grepping templates is insufficient. |
+| GitOps repository | CI renders the final Helm/Kustomize/Argo CD manifests and records repository path and environment. |
+| Kubernetes | A [validating admission policy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/) rejects forbidden images; a controller periodically snapshots images in live containers, init containers, and ephemeral containers. |
+
+GitLab Pipeline Execution Policies can make the inventory job mandatory, but require GitLab Ultimate. GitHub reusable workflows must likewise be required by organization/repository policy. On uncontrolled runners, an arbitrary shell command can still pull an unreported image; absolute runtime enforcement requires runner, network, or registry control.
+
+### Snapshot protocol
+
+Each reporter submits its **complete current image set**, not individual add/delete events. A successful report replaces that consumer’s previous snapshot, so the next scan naturally captures additions, changes, and removals. An empty snapshot is valid and means that consumer no longer uses any Foundry image.
+
+The logical Foundry ID identifies the maintained image; the resolved digest identifies the exact artifact. Store both—tags alone are mutable. A reference counts as Foundry only when its registry, namespace, and prefixed name match the configured Foundry location.
+
+A snapshot contains:
+
+- stable consumer ID: platform, repository or cluster, component/path, and environment;
+- source revision, ordered run ID, observation time, and detector version;
+- observation kind: `declared`, `live`, or `build-dependency`;
+- for every occurrence: Foundry ID, requested reference, resolved digest, and file/job/workload location.
+
+PR/MR scans validate and preview the inventory delta; only a default-branch merge replaces declared state. Scheduled scans refresh unchanged consumers and expose reporters that have stopped running. The receiver ignores older run IDs, replaces snapshots atomically, marks missed heartbeats stale, and removes a consumer only after an explicit decommission or retention timeout.
+
+Reporters authenticate to a small ingestion API with [GitHub](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws) or [GitLab](https://docs.gitlab.com/ci/cloud_services/aws/) OIDC and may update only their own consumer ID. They do not receive permission to commit to this repository or long-lived AWS credentials.
+
+### Storage
+
+Use DynamoDB for current state, not Git commits:
+
+- consumer-indexed records make a complete snapshot replaceable;
+- an image-indexed GSI answers “who uses this image?”;
+- a versioned snapshot is written first, then `current_generation` is switched only if its run ID is newer, preventing partial or out-of-order replacement;
+- reverse-index edges carry that generation; queries verify it is current and old generations expire by TTL;
+- S3 retains raw snapshots and activity history, while CI artifacts show PR/MR deltas.
+
+Git remains the source for catalog, scanner, API, schema, and infrastructure code—not rapidly changing inventory data. Registry telemetry is a separate append-only activity source: snapshots show declared or live usage, while registry events show actual pulls. Both use the resolved image digest as their common identity.
+
+### Lifecycle effects
+
+- Publishing a new base digest finds and rebuilds or flags all derived Foundry images.
+- A catalog-removal PR/MR lists every dependent image and consumer and is blocked while either remains.
+- After consumers migrate, catalog reconciliation deletes the image branch; registry artifacts follow a separate retention policy rather than disappearing immediately.
+
+The resulting flow is: **detect → validate against the catalog → publish a snapshot → update the dependency/consumer graph → gate unsafe image changes**.
+
 ## Primitive CI snippets
 
 <details>
